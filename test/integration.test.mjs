@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, cpSync, writeFileSync, appendFileSync, readFileSync, rmSync, existsSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, cpSync, writeFileSync, appendFileSync, readFileSync, rmSync, existsSync, mkdirSync, symlinkSync, realpathSync, renameSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -42,6 +42,34 @@ test('CLI reports unchanged committed sources and creates complete output pair',
   assert.equal(JSON.parse(result.stdout).verdict, 'UNCHANGED');
   assert.equal(JSON.parse(readFileSync(join(out, 'report.json'))).verdict, 'UNCHANGED');
   assert.match(readFileSync(join(out, 'summary.md'), 'utf8'), /UNCHANGED/);
+});
+test('repository discovery works from both an ordinary root and a nested directory', t => {
+  const f = fixture(t);
+  const nested = join(f.repo, 'working directory', 'nested');
+  mkdirSync(nested, { recursive: true });
+  const expected = statSync(f.repo, { bigint: true });
+  for (const directory of [f.repo, nested]) {
+    // Git may expand a Windows 8.3 alias (RUNNER~1) to its long name. Verify
+    // the actual directory identity rather than requiring one path spelling.
+    const observed = statSync(repositoryRoot(directory), { bigint: true });
+    assert.equal(observed.isDirectory(), true);
+    assert.equal(observed.dev, expected.dev);
+    assert.equal(observed.ino, expected.ino);
+    assert.equal(runComparison({ repo: directory, base: f.base, head: f.base }).report.verdict, 'UNCHANGED');
+  }
+});
+test('POSIX repository roots retain significant trailing whitespace', { skip: process.platform === 'win32' }, t => {
+  for (const suffix of [' ', '\t', '\r', '\n', '\u00a0']) {
+    const f = fixture(t);
+    const renamed = f.repo + suffix;
+    renameSync(f.repo, renamed);
+    t.after(() => rmSync(renamed, { recursive: true, force: true }));
+    f.repo = renamed;
+    assert.equal(repositoryRoot(f.repo), realpathSync(f.repo));
+    const result = cli(f, ['--mode', 'strict']);
+    assert.equal(result.status, 0, JSON.stringify({ suffix, stdout: result.stdout, stderr: result.stderr }));
+    assert.equal(JSON.parse(result.stdout).verdict, 'UNCHANGED');
+  }
 });
 test('strict and advisory modes preserve identical affected claims but differ in exit status', t => {
   const f = fixture(t); appendFileSync(join(f.repo, 'sources/fictional-policy.md'), '\nChanged fictional text.\n'); const head = f.commit();
@@ -104,4 +132,23 @@ test('CLI refuses existing output and preserves its content', t => {
 test('report output cannot target Git administration directories', t => {
   const f = fixture(t); const result = runComparison({ repo: f.repo, base: f.base, head: f.base });
   assert.throws(() => writeReports(join(f.repo, '.git', 'report'), result), /administration/);
+});
+test('report output cannot enter Git administration through a parent symlink or junction', t => {
+  const f = fixture(t); const result = runComparison({ repo: f.repo, base: f.base, head: f.base });
+  const alias = join(f.repo, 'report-parent');
+  symlinkSync(join(f.repo, '.git'), alias, process.platform === 'win32' ? 'junction' : 'dir');
+  assert.throws(() => writeReports(join(alias, 'report'), result), /administration/);
+  assert.equal(existsSync(join(f.repo, '.git', 'report')), false);
+});
+test('an ordinary parent symlink or junction retains complete reports and exclusive creation', t => {
+  const f = fixture(t); const result = runComparison({ repo: f.repo, base: f.base, head: f.base });
+  const parent = join(f.repo, 'reports');
+  const alias = join(f.repo, 'report-parent');
+  mkdirSync(parent);
+  symlinkSync(parent, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const paths = writeReports(join(alias, 'run'), result);
+  assert.equal(realpathSync(paths.reportPath), join(realpathSync(parent), 'run', 'report.json'));
+  assert.deepEqual(JSON.parse(readFileSync(paths.reportPath, 'utf8')), result.report);
+  assert.equal(readFileSync(paths.summaryPath, 'utf8'), result.markdown);
+  assert.throws(() => writeReports(join(alias, 'run'), result), /existing output/);
 });
